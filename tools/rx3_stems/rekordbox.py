@@ -71,26 +71,56 @@ def file_url_to_path(value: str) -> pathlib.Path:
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme and parsed.scheme != "file":
         raise ValueError(f"Location is not a local file: {value}")
+
     path = urllib.parse.unquote(parsed.path if parsed.scheme else value)
-    # Rekordbox on Windows exports file://localhost/C:/Music/Track.aiff. The
-    # leading slash belongs to the URL path, not to the filesystem path.
+
+    # Rekordbox on Windows exports:
+    # file://localhost/C:/Music/Track.mp3
+    #
+    # The leading slash belongs to the URL path, not to the filesystem path.
     if DRIVE_LETTER.match(path):
         path = path[1:]
+
     return pathlib.Path(path)
 
 
 def safe_stem(value: str) -> str:
-    """Reduce a filename stem to what the RX3 load interface can match."""
-    value = unicodedata.normalize("NFC", value).replace("/", "_").replace(":", "_")
-    value = "".join(character for character in value if ord(character) >= 32).strip(" .")
+    """Reduce a filename stem without destroying meaningful filename characters.
+
+    IMPORTANT:
+    Trailing spaces are intentionally preserved.
+
+    Rekordbox can export files whose real names contain a trailing space before
+    the extension, for example:
+
+        Vanesa ft. Aneliq - Puma .mp3
+
+    The RX3 deck uses that exact exported basename when locating the matching
+    .rx3stem sidecar. Removing the trailing space causes a mismatch.
+
+    We still normalize Unicode and replace characters that cannot safely be
+    represented in the generated filename, but we do NOT strip trailing spaces
+    or dots.
+    """
+    value = unicodedata.normalize("NFC", value)
+    value = value.replace("/", "_").replace(":", "_")
+
+    # Remove control characters, but preserve ordinary spaces including a
+    # meaningful trailing space.
+    value = "".join(
+        character
+        for character in value
+        if ord(character) >= 32
+    )
+
     return value[:180] or "track"
 
 
 def export_stem(value: str) -> str:
-    """The stem this file carries once Rekordbox has exported it to a drive.
+    """Return the exact stem that the exported RX3 file carries.
 
-    A stem already within the limit is returned unchanged, so a drive filled by
-    hand rather than by an export matches just the same.
+    The only transformation here is the Rekordbox 44-character export limit.
+    In particular, trailing spaces are preserved.
     """
     return safe_stem(value)[:EXPORT_STEM_LIMIT] or "track"
 
@@ -98,20 +128,28 @@ def export_stem(value: str) -> str:
 def parse_collection(xml_path: pathlib.Path) -> Collection:
     """Parse a Rekordbox XML export into playlists of resolved tracks."""
     root = ET.parse(xml_path).getroot()
+
     if root.tag != "DJ_PLAYLISTS":
         raise ValueError("This file is not a Rekordbox XML export")
+
     collection = root.find("COLLECTION")
     playlists_root = root.find("PLAYLISTS")
+
     if collection is None or playlists_root is None:
-        raise ValueError("COLLECTION or PLAYLISTS is missing from the XML export")
+        raise ValueError(
+            "COLLECTION or PLAYLISTS is missing from the XML export"
+        )
 
     tracks: dict[str, Track] = {}
+
     for node in collection.findall("TRACK"):
         try:
             path = file_url_to_path(node.get("Location", ""))
         except ValueError:
             path = pathlib.Path("")
+
         track_id = node.get("TrackID", "")
+
         tracks[track_id] = Track(
             track_id=track_id,
             title=node.get("Name", "Untitled"),
@@ -127,25 +165,42 @@ def parse_collection(xml_path: pathlib.Path) -> Collection:
         for node in parent.findall("NODE"):
             name = node.get("Name", "Unnamed")
             path_names = names + (name,)
+
             if node.get("Type") == "1":
                 selected = tuple(
                     tracks[key]
-                    for key in (child.get("Key", "") for child in node.findall("TRACK"))
+                    for key in (
+                        child.get("Key", "")
+                        for child in node.findall("TRACK")
+                    )
                     if key in tracks
                 )
-                playlists.append(Playlist(
-                    playlist_id=str(len(playlists)),
-                    name=name,
-                    path=" / ".join(path_names),
-                    tracks=selected,
-                ))
+
+                playlists.append(
+                    Playlist(
+                        playlist_id=str(len(playlists)),
+                        name=name,
+                        path=" / ".join(path_names),
+                        tracks=selected,
+                    )
+                )
             else:
                 walk(node, path_names)
 
-    # Rekordbox wraps every playlist in a single folder node named ROOT, which
-    # carries no information and only lengthens each displayed path.
+    # Rekordbox wraps every playlist in a single folder node named ROOT,
+    # which carries no information and only lengthens each displayed path.
     top_level = playlists_root.findall("NODE")
-    container = top_level[0] if len(top_level) == 1 and top_level[0].get("Type") == "0" \
+
+    container = (
+        top_level[0]
+        if len(top_level) == 1 and top_level[0].get("Type") == "0"
         else playlists_root
+    )
+
     walk(container, ())
-    return Collection(xml=xml_path, track_count=len(tracks), playlists=tuple(playlists))
+
+    return Collection(
+        xml=xml_path,
+        track_count=len(tracks),
+        playlists=tuple(playlists),
+    )
